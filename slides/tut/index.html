@@ -17,7 +17,7 @@
     </style>
   </head>
   <body>
-    <textarea id="source">
+      <textarea id="source">
 
 ```tut:invisible
 
@@ -33,42 +33,604 @@ Ross A. Baker • `@rossabaker`
 - see https://remarkjs.com/#1
 
 ---
-# Inline Scala examples
-
-```tut:silent
-case class Person(name: String, age: Int)
-```
+# JDBC is brutishly imperative
 
 ```tut:book
-val john = Person("John", 23)
+import java.sql._
+Class.forName("org.postgresql.Driver")
+def getConn = DriverManager.getConnection(
+    "jdbc:postgresql:world", "indyscala", "password") 
 
-john.age
-
-john.copy(age = 30)
+val headOfState = {
+  val conn = getConn
+  try {
+    val stmt = conn.createStatement()
+    try {
+      val rs = stmt.executeQuery("SELECT * FROM country WHERE code = 'USA'")
+      try {
+        if (rs.next()) Some(rs.getString("headofstate"))
+        else None
+      } finally rs.close()
+    } finally stmt.close()
+  } finally conn.close()
+}
 ```
 
-???
-- see https://github.com/tpolecat/tut
+--
+
+This result was current the last time I wrote code like this.
 
 ---
-# Scala examples from core module
+# Counting the atrocities
+
+--
+
+* No resource safety
+
+--
+
+* No null safety
+
+--
+
+* No type mapping
+
+--
+
+* Not composeable
+
+---
+## ResultSet is stateful
 
 ```tut:silent
-import indyscala.doobie.Foo.{FooInt, FooString}
+case class Country(name: String, headOfState: String)
+
+def country(rs: ResultSet): Option[Country] = {
+  if (rs.next()) Some(Country(rs.getString("name"), rs.getString("headOfState")))
+  else None
+}
+val conn = getConn
 ```
 
 ```tut:book
-val fooInt = FooInt(5)
-val fooString = FooString("Hello World")
-
-val foos = List(fooInt, fooString)
+val query = "SELECT * FROM country WHERE continent = 'Europe' ORDER BY population ASC"
+try {
+  val stmt = conn.createStatement()
+  try {
+    val rs = stmt.executeQuery(query)
+    println("Country: "+country(rs).fold("")(_.name))
+    println("Head of state: "+country(rs).fold("")(_.headOfState))
+  } finally stmt.close()
+} finally conn.close()
 ```
+
+--
+His Majesty Harald V is not the head of state of the Vatican City.
+
+---
+## Easy to leak
+
+```scala
+try {
+  val stmt = getConn.createStatement()
+  try {
+    val rs = stmt.executeQuery(query)
+    println("Country: "+country(rs).fold("")(_.name))
+    println("Head of state: "+country(rs).fold("")(_.headOfState))
+  } finally stmt.close()
+} finally getConn.close()  
+```
+
+--
+
+`getConn` opens a new connection on each invocation. The finally block opens a
+new connection and closes it immediately, and the original connection is never
+closed.
+
+---
+# Referential transparency
+
+We made errors of substitution.
+
+```scala
+val c = country(rs)
+f(c) != f(country(rs))
+```
+
+```scala
+val conn = getConn
+conn != getConn
+```
+
+---
+# Programs as values
+
+```tut:silent
+sealed trait ResultSetOp[A]
+case class Next() extends ResultSetOp[Boolean]
+case class GetString(name: String) extends ResultSetOp[String]
+```
+
+--
+
+The operation has a _single type parameter_.
+
+--
+
+Operations are _sequential_, depending on the previous result.
+
+--
+
+Sounds like a ...
+
+---
+# MONAD!!!
+
+```tut:book:fail
+val country: ResultSetOp[Option[Country]] = Next().flatMap {
+  case true =>
+    for { 
+      name <- GetString("name")
+      headOfState <- GetString("headofstate")
+    } yield Some(Country(name, headOfState))
+  case false =>
+    None
+}
+```
+
+--
+
+Well, not quite.
+
+---
+# Monad review
+
+```tut:silent
+trait Monad[F[_]] {
+  def pure[A](a: A): F[A]
+  def flatMap[A, B](fa: F[A])(f: A => F[B]): F[B]
+}
+```
+
+--
+
+* Left identity:
+  `Monad[F].pure(a).flatMap(f) == f(a)`
+
+--
+
+* Right identity:
+  `fa.flatMap(Monad[F].pure) == fa`
+
+--
+
+* Associativity:
+  `fa.flatMap(f).flatMap(g) == fa.flatMap(a => f(a).flatMap(g))`
+
+---
+# Free
+
+```tut:silent
+sealed trait Free[F[_], A]
+case class Pure[F[_], A](a: A) extends Free[F, A]
+case class FlatMap[F[_], I, A](fi: F[I], k: I => Free[F, A]) extends Free[F, A]
+
+val country: Free[ResultSetOp, Option[Country]] =
+  FlatMap(Next(), { b: Boolean => b match {
+    case true =>
+      FlatMap(GetString("name"), { name: String =>
+        FlatMap(GetString("headOfState"), { headOfState: String =>
+          Pure(Some(Country(name, headOfState)))})})
+    case false =>
+      Pure(None)
+  }})
+```
+
+--
+
+There's probably more food on the counter. Go now, and maybe it will look
+better by the time your return.
+
+---
+# Free
+
+```tut:silent
+sealed trait Free[F[_], A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B]
+  def map[B](f: A => B): Free[F, B]
+}
+case class Pure[F[_], A](a: A) extends Free[F, A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B] = f(a)
+  def map[B](f: A => B): Free[F, B] = flatMap { a: A => Pure(f(a)) }
+}
+case class FlatMap[F[_], I, A](fi: F[I], k: I => Free[F, A]) extends Free[F, A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B] = FlatMap(fi, k.andThen(_.flatMap(f)))
+  def map[B](f: A => B): Free[F, B] = flatMap { a: A => Pure(f(a)) }
+}
+def liftF[F[_], A](fa: F[A]): Free[F, A] = FlatMap(fa, Pure.apply)
+
+val country: Free[ResultSetOp, Option[Country]] =
+  liftF(Next()).flatMap {
+    case true =>
+      for {
+        name <- liftF(GetString("name"))
+        headOfState <- liftF(GetString("headofstate"))
+      } yield Some(Country(name, headOfState))
+    case false => Pure(None)
+  }
+```
+---
+# Improving the DSL
+
+```tut:silent
+type ResultSetIO[A] = Free[ResultSetOp, A]
+object ResultSetIO {
+  def next() = liftF(Next())
+  def getString(column: String) = liftF(GetString(column))
+  def pure[A](a: A) = Pure[ResultSetOp, A](a)
+}
+
+import ResultSetIO._
+val country: ResultSetIO[Option[Country]] =
+  next().flatMap {
+    case true =>
+      for {
+        name <- getString("name")
+        headOfState <- getString("headofstate")
+      } yield Some(Country(name, headOfState))
+    case false => pure(None)
+  }
+```
+
+---
+# Interpreter
+
+```tut:silent
+import cats.~>, cats.effect.IO
+
+def interp(rs: ResultSet) = new (ResultSetOp ~> IO) {
+  def apply[A](op: ResultSetOp[A]): IO[A] = op match {
+    case Next() => IO(rs.next())
+    case GetString(column) => IO(rs.getString(column))
+  }
+}
+```
+
+--
+
+We could have made this work for other effect types, such as `monix.eval.Task`,
+by using `cats.effect.Sync`.
+
+---
+# runFree
+
+```tut:silent
+import cats.~>, cats.Monad
+def runFree[F[_], G[_], A](prog: Free[F, A])(f: F ~> G)(implicit G: Monad[G]): G[A] =
+  prog match {
+    case Pure(a) => G.pure(a)
+    case FlatMap(fi, k) =>
+      G.flatMap(f(fi))(a => runFree(k(a))(f))
+  }
+
+def countryIO(rs: ResultSet): IO[Option[Country]] = runFree(country)(interp(rs))
+```
+
+---
+# That's lovely, but it doesn't work
+
+```tut:book
+import cats.implicits._
+val prog: IO[Unit] = {
+  val conn = getConn
+  try { 
+    val stmt = conn.createStatement()
+    try {
+      val rs = stmt.executeQuery(query)
+      runFree(country)(interp(rs)).flatMap { c =>
+        IO(println("Country: "+c.fold("")(_.name))) >>
+        IO(println("Head of state: "+c.fold("")(_.headOfState)))
+      }
+    } finally stmt.close()
+  } finally conn.close()
+}
+```
+
+```tut:fail
+prog.unsafeRunSync()
+```
+
+---
+# Why just `ResultSetIO`?
+
+--
+
+* What if we had `StatementIO`?
+
+--
+
+* What if we had `ConnectionIO`?
+
+--
+
+* But how would we transition between them?
+
+---
+# Doobie
+
+          <blockquote class="twitter-tweet" data-lang="en"><p lang="en" dir="ltr">Is that legal in Indiana now? <a href="https://t.co/Y75oUnZgBx">pic.twitter.com/Y75oUnZgBx</a></p>&mdash; sr. chewbacca consultant (@rit) <a href="https://twitter.com/rit/status/1067821093908471820?ref_src=twsrc%5Etfw">November 28, 2018</a></blockquote>
+
+---
+# Low-level API
+
+```tut:invisible
+import doobie.free.{resultset => RS}
+val country: RS.ResultSetIO[Option[Country]] =
+  RS.next.flatMap {
+    case true =>
+      for {
+        name <- RS.getString("name")
+        headOfState <- RS.getString("headofstate")
+      } yield Some(Country(name, headOfState))
+    case false => RS.pure(None)
+  }
+```
+
+```tut:silent
+import doobie.free.{connection => C, statement => S, resultset => RS}
+import doobie.util.catchsql.guarantee
+val prog: C.ConnectionIO[Option[Country]] = {
+  guarantee[C.ConnectionIO, Option[Country]](
+    C.createStatement.flatMap(C.embed(_,
+      guarantee[S.StatementIO, Option[Country]](
+        S.executeQuery(query).flatMap(S.embed(_,
+          guarantee[RS.ResultSetIO, Option[Country]](country)(
+            RS.close))))(S.close))))(C.close)
+}
+```
+
+--
+* `guarantee` is like a functional `finally`
+
+--
+* `embed` lets us embed one level of JDBC operation in another
+
+--
+* Provided a `Connection`, we can interpret this into `IO`
+
+--
+* If you write code like this, it might be something to talk about
+should you ever meet the Head of State of the Vatican City.
+
+---
+# What have we wrought?
+
+--
+* All this work got us referential transparency
+
+--
+* Referential transparency permits substitution
+
+--
+* Substitution permits composition
+
+--
+* We can compose higher-level APIs on top of the low level API
+
+---
+# High level
+
+```tut:book
+import doobie._, doobie.implicits._
+val program = {
+  sql"""select name, headofstate from country
+        where continent = 'Europe' order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+```
+
+--
+* `sql` defines a `Fragment`. More about this in a bit.
+
+--
+* `query` maps our results to a primitive, tuple, case class, `Option`, `HList`, and more.
+
+--
+* `.to` maps the result set to a collection.  Can also do a unique value, an `Option`, a `NonEmptyList`, or an `fs2.Stream`
+
+--
+* Safely acquires and disposes of JDBC resources
+
+---
+# Transactor
+
+`xa` is a _transactor_.
+
+```tut:silent
+import cats.effect._
+implicit val cs = IO.contextShift(scala.concurrent.ExecutionContext.global)
+val xa = Transactor.fromDriverManager[IO](
+  "org.postgresql.Driver", // driver classname
+  "jdbc:postgresql:world", // connect URL (driver-specific)
+  "indyscala",             // user
+  "password"               // password
+)
+```
+
+--
+* Borrows a `Connection` from the `DriverManager`
+
+--
+* Shifts execution to a thread pool for blocking
+
+--
+* Begins a transaction
+
+--
+* Interprets the `ConnectionIO ~> IO`
+
+--
+* Commits (or rolls back) the transaction
+
+--
+* Shifts back to the `ContextShift`
+
+---
+# Does it work?
+
+```tut:book:fail
+program.transact(xa).unsafeRunSync()
+```
+
+---
+# The bad news is that San Marino has two Captains Regent
+
+and therefore a null `headofstate` column.
+
+--
+
+The good news is that we can easily validate our queries at test time.
+
+---
+# Testing
+```scala
+check(query)
+```
+
+```
+[info] + Query0[Test.Country] defined at Test.scala:25
+[info]   
+[info]     select name, headofstate from country
+[info]     where continent = 'Europe' order by population asc
+[info]   
+[info]   + SQL Compiles and TypeChecks
+[info]   + C01 name        VARCHAR (text) NOT NULL  →  String
+[error]   x C02 headofstate VARCHAR (text) NULL      →  String
+[error]    Reading a NULL value into String will result in a runtime failure. Fix
+[error]    this by making the schema type NOT NULL or by changing the Scala type
+[error]    to Option[String] (analysisspec.scala:66)
+```
+
+---
+# Habemus papam
+
+```tut:book
+import doobie._, doobie.implicits._
+case class Country(name: String, headOfState: Option[String])
+val program = {
+  sql"""select name, headofstate from country
+        where continent = 'Europe' order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+program.transact(xa).unsafeRunSync()
+```
+
+---
+# Tracing
+
+If we turn on trace logging (and get on a branch), we can see the operations it
+compiled down to.
+
+```
+TRACE doobie.transactor - PgConnection<2baa1fe>.setAutoCommit(false)
+TRACE doobie.transactor - PgConnection<2baa1fe>.prepareStatement(select name, headofstte from country
+lation asc)
+TRACE doobie.transactor - PgPreparedStatement<61cb1b5c>.executeQuery()
+TRACE doobie.transactor - PgResultSet<3213cd26>.close()
+TRACE doobie.transactor - PgPreparedStatement<61cb1b5c>.close()
+TRACE doobie.transactor - PgConnection<2baa1fe>.commit()
+TRACE doobie.transactor - PgConnection<2baa1fe>.close()
+```
+
+---
+# Revisiting the atrocities
+
+--
+* ~~No resource safety~~
+
+--
+
+* ~~No null safety~~
+
+--
+
+* ~~No type mapping~~
+
+--
+
+* ~~Not composeable~~
+
+---
+# That `sql` is an interpolator
+
+```tut:book
+def program(continent: String) = {
+  sql"""select name, headofstate from country
+        where continent = $continent order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+program("Asia").transact(xa).unsafeRunSync()
+```
+
+---
+# You can compose queries from fragments
+
+```tut:silent
+import Fragments.whereAndOpt
+def query(continent: Option[String], region: Option[String]) = {
+  val q =
+    fr"SELECT name, headofstate from country" ++
+    whereAndOpt(
+      continent.map(c => fr"continent = $c"),
+      region.map(r => fr"region = $r")
+    ) ++
+    fr"ORDER BY population asc"
+  q.query[Country]
+}
+```
+
+```tut:book
+query(None, Some("Caribbean")).to[List].map(_.take(1)).transact(xa)
+```
+
+---
+# fs2 integration
+
+All of these examples have been materializing the entire
+result set (`to[List]`), which is a step backward from
+idiomatic JDBC.  But we can functionally stream them!
+
+```tut:silent
+query(Some("Africa"), None).
+  stream.
+  take(5).
+  transact(xa).
+  compile
+```
+
+--
+
+I'd show you the results, but it hangs tut.  But it works.
+
+---
+# Appreciation
+
+* [DemandJump](https://www.demandjump.com/) for hosting
+* Rob Norris for Doobie
+* You all, for not leaving at the depths of the low-level free monad
 
 ---
 class: center, middle
 
-# Thanks!
-Code and slides at `rossabaker/doobie` on GitHub
+# Thanks! Code and slides at `indyscala/doobie` on GitHub
+
+I'm `@rossabaker` on GitHub and Twitter and I work at @FormationAI.
 
 ## Questions?
 
@@ -79,6 +641,7 @@ Code and slides at `rossabaker/doobie` on GitHub
  </textarea>
     <script src="remark-latest.min.js">
     </script>
+    <script src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
     <script>
       var slideshow = remark.create();
     </script>

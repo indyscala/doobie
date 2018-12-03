@@ -24,6 +24,16 @@ lazy val doobie = project.in(file("."))
 lazy val core = project
   .settings(moduleName := "doobie-core")
   .settings(baseSettings: _*)
+  .settings(
+    libraryDependencies ++= List(
+      "co.fs2" %% "fs2-io" % "1.0.0",
+      "org.typelevel" %% "cats-core" % "1.5.0",
+      "org.typelevel" %% "cats-effect" % "1.0.0",
+      "org.tpolecat" %% "doobie-specs2" % "0.6.1-SNAPSHOT",
+      "org.postgresql" % "postgresql" % "42.2.5",
+      "ch.qos.logback" % "logback-classic" % "1.2.3"
+    )
+  )
 
 
 lazy val slides = project
