@@ -1,0 +1,726 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>IndyScala: Doobie</title>
+    <meta charset="utf-8">
+    <style>
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif', 'Helvetica'; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz', 'Gill Sans';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono', 'Consolas', 'Courier New'; }
+    </style>
+  </head>
+  <body>
+      <textarea id="source">
+
+
+
+
+class: center, middle
+
+# IndyScala: Doobie
+Ross A. Baker • `@rossabaker`
+
+???
+- notes here
+- see https://remarkjs.com/#1
+
+---
+# JDBC is brutishly imperative
+
+```scala
+import java.sql._
+// import java.sql._
+
+Class.forName("org.postgresql.Driver")
+// res0: Class[_] = class org.postgresql.Driver
+
+def getConn = DriverManager.getConnection(
+    "jdbc:postgresql:world", "indyscala", "password") 
+// getConn: java.sql.Connection
+
+val headOfState = {
+  val conn = getConn
+  try {
+    val stmt = conn.createStatement()
+    try {
+      val rs = stmt.executeQuery("SELECT * FROM country WHERE code = 'USA'")
+      try {
+        if (rs.next()) Some(rs.getString("headofstate"))
+        else None
+      } finally rs.close()
+    } finally stmt.close()
+  } finally conn.close()
+}
+// headOfState: Option[String] = Some(George W. Bush)
+```
+
+--
+
+This result was current the last time I wrote code like this.
+
+---
+# Counting the atrocities
+
+--
+
+* No resource safety
+
+--
+
+* No null safety
+
+--
+
+* No type mapping
+
+--
+
+* Not composeable
+
+---
+## ResultSet is stateful
+
+```scala
+case class Country(name: String, headOfState: String)
+
+def country(rs: ResultSet): Option[Country] = {
+  if (rs.next()) Some(Country(rs.getString("name"), rs.getString("headOfState")))
+  else None
+}
+val conn = getConn
+```
+
+```scala
+val query = "SELECT * FROM country WHERE continent = 'Europe' ORDER BY population ASC"
+// query: String = SELECT * FROM country WHERE continent = 'Europe' ORDER BY population ASC
+
+try {
+  val stmt = conn.createStatement()
+  try {
+    val rs = stmt.executeQuery(query)
+    println("Country: "+country(rs).fold("")(_.name))
+    println("Head of state: "+country(rs).fold("")(_.headOfState))
+  } finally stmt.close()
+} finally conn.close()
+// Country: Holy See (Vatican City State)
+// Head of state: Harald V
+```
+
+--
+His Majesty Harald V is not the head of state of the Vatican City.
+
+---
+## Easy to leak
+
+```scala
+try {
+  val stmt = getConn.createStatement()
+  try {
+    val rs = stmt.executeQuery(query)
+    println("Country: "+country(rs).fold("")(_.name))
+    println("Head of state: "+country(rs).fold("")(_.headOfState))
+  } finally stmt.close()
+} finally getConn.close()  
+```
+
+--
+
+`getConn` opens a new connection on each invocation. The finally block opens a
+new connection and closes it immediately, and the original connection is never
+closed.
+
+---
+# Referential transparency
+
+We made errors of substitution.
+
+```scala
+val c = country(rs)
+f(c) != f(country(rs))
+```
+
+```scala
+val conn = getConn
+conn != getConn
+```
+
+---
+# Programs as values
+
+```scala
+sealed trait ResultSetOp[A]
+case class Next() extends ResultSetOp[Boolean]
+case class GetString(name: String) extends ResultSetOp[String]
+```
+
+--
+
+The operation has a _single type parameter_.
+
+--
+
+Operations are _sequential_, depending on the previous result.
+
+--
+
+Sounds like a ...
+
+---
+# MONAD!!!
+
+```scala
+val country: ResultSetOp[Option[Country]] = Next().flatMap {
+  case true =>
+    for { 
+      name <- GetString("name")
+      headOfState <- GetString("headofstate")
+    } yield Some(Country(name, headOfState))
+  case false =>
+    None
+}
+// <console>:23: error: value flatMap is not a member of Next
+//        val country: ResultSetOp[Option[Country]] = Next().flatMap {
+//                                                           ^
+// <console>:26: error: value flatMap is not a member of GetString
+//              name <- GetString("name")
+//                               ^
+// <console>:27: error: value map is not a member of GetString
+//              headOfState <- GetString("headofstate")
+//                                      ^
+```
+
+--
+
+Well, not quite.
+
+---
+# Monad review
+
+```scala
+trait Monad[F[_]] {
+  def pure[A](a: A): F[A]
+  def flatMap[A, B](fa: F[A])(f: A => F[B]): F[B]
+}
+```
+
+--
+
+* Left identity:
+  `Monad[F].pure(a).flatMap(f) == f(a)`
+
+--
+
+* Right identity:
+  `fa.flatMap(Monad[F].pure) == fa`
+
+--
+
+* Associativity:
+  `fa.flatMap(f).flatMap(g) == fa.flatMap(a => f(a).flatMap(g))`
+
+---
+# Free
+
+```scala
+sealed trait Free[F[_], A]
+case class Pure[F[_], A](a: A) extends Free[F, A]
+case class FlatMap[F[_], I, A](fi: F[I], k: I => Free[F, A]) extends Free[F, A]
+
+val country: Free[ResultSetOp, Option[Country]] =
+  FlatMap(Next(), { b: Boolean => b match {
+    case true =>
+      FlatMap(GetString("name"), { name: String =>
+        FlatMap(GetString("headOfState"), { headOfState: String =>
+          Pure(Some(Country(name, headOfState)))})})
+    case false =>
+      Pure(None)
+  }})
+```
+
+--
+
+There's probably more food on the counter. Go now, and maybe it will look
+better by the time your return.
+
+---
+# Free
+
+```scala
+sealed trait Free[F[_], A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B]
+  def map[B](f: A => B): Free[F, B]
+}
+case class Pure[F[_], A](a: A) extends Free[F, A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B] = f(a)
+  def map[B](f: A => B): Free[F, B] = flatMap { a: A => Pure(f(a)) }
+}
+case class FlatMap[F[_], I, A](fi: F[I], k: I => Free[F, A]) extends Free[F, A] {
+  def flatMap[B](f: A => Free[F, B]): Free[F, B] = FlatMap(fi, k.andThen(_.flatMap(f)))
+  def map[B](f: A => B): Free[F, B] = flatMap { a: A => Pure(f(a)) }
+}
+def liftF[F[_], A](fa: F[A]): Free[F, A] = FlatMap(fa, Pure.apply)
+
+val country: Free[ResultSetOp, Option[Country]] =
+  liftF(Next()).flatMap {
+    case true =>
+      for {
+        name <- liftF(GetString("name"))
+        headOfState <- liftF(GetString("headofstate"))
+      } yield Some(Country(name, headOfState))
+    case false => Pure(None)
+  }
+```
+---
+# Improving the DSL
+
+```scala
+type ResultSetIO[A] = Free[ResultSetOp, A]
+object ResultSetIO {
+  def next() = liftF(Next())
+  def getString(column: String) = liftF(GetString(column))
+  def pure[A](a: A) = Pure[ResultSetOp, A](a)
+}
+
+import ResultSetIO._
+val country: ResultSetIO[Option[Country]] =
+  next().flatMap {
+    case true =>
+      for {
+        name <- getString("name")
+        headOfState <- getString("headofstate")
+      } yield Some(Country(name, headOfState))
+    case false => pure(None)
+  }
+```
+
+---
+# Interpreter
+
+```scala
+import cats.~>, cats.effect.IO
+
+def interp(rs: ResultSet) = new (ResultSetOp ~> IO) {
+  def apply[A](op: ResultSetOp[A]): IO[A] = op match {
+    case Next() => IO(rs.next())
+    case GetString(column) => IO(rs.getString(column))
+  }
+}
+```
+
+--
+
+We could have made this work for other effect types, such as `monix.eval.Task`,
+by using `cats.effect.Sync`.
+
+---
+# runFree
+
+```scala
+import cats.~>, cats.Monad
+def runFree[F[_], G[_], A](prog: Free[F, A])(f: F ~> G)(implicit G: Monad[G]): G[A] =
+  prog match {
+    case Pure(a) => G.pure(a)
+    case FlatMap(fi, k) =>
+      G.flatMap(f(fi))(a => runFree(k(a))(f))
+  }
+
+def countryIO(rs: ResultSet): IO[Option[Country]] = runFree(country)(interp(rs))
+```
+
+---
+# That's lovely, but it doesn't work
+
+```scala
+import cats.implicits._
+// import cats.implicits._
+
+val prog: IO[Unit] = {
+  val conn = getConn
+  try { 
+    val stmt = conn.createStatement()
+    try {
+      val rs = stmt.executeQuery(query)
+      runFree(country)(interp(rs)).flatMap { c =>
+        IO(println("Country: "+c.fold("")(_.name))) >>
+        IO(println("Head of state: "+c.fold("")(_.headOfState)))
+      }
+    } finally stmt.close()
+  } finally conn.close()
+}
+// prog: cats.effect.IO[Unit] = IO$187918208
+```
+
+```scala
+scala> prog.unsafeRunSync()
+org.postgresql.util.PSQLException: This ResultSet is closed.
+  at org.postgresql.jdbc.PgResultSet.checkClosed(PgResultSet.java:2741)
+  at org.postgresql.jdbc.PgResultSet.next(PgResultSet.java:1829)
+  at $anon$1.$anonfun$apply$1(<console>:28)
+  at scala.runtime.java8.JFunction0$mcZ$sp.apply(JFunction0$mcZ$sp.java:12)
+  at cats.effect.internals.IORunLoop$.step(IORunLoop.scala:176)
+  at cats.effect.IO.unsafeRunTimed(IO.scala:321)
+  at cats.effect.IO.unsafeRunSync(IO.scala:240)
+  ... 43 elided
+```
+
+---
+# Why just `ResultSetIO`?
+
+--
+
+* What if we had `StatementIO`?
+
+--
+
+* What if we had `ConnectionIO`?
+
+--
+
+* But how would we transition between them?
+
+---
+# Doobie
+
+          <blockquote class="twitter-tweet" data-lang="en"><p lang="en" dir="ltr">Is that legal in Indiana now? <a href="https://t.co/Y75oUnZgBx">pic.twitter.com/Y75oUnZgBx</a></p>&mdash; sr. chewbacca consultant (@rit) <a href="https://twitter.com/rit/status/1067821093908471820?ref_src=twsrc%5Etfw">November 28, 2018</a></blockquote>
+
+---
+# Low-level API
+
+
+
+
+```scala
+import doobie.free.{connection => C, statement => S, resultset => RS}
+import doobie.util.catchsql.guarantee
+val prog: C.ConnectionIO[Option[Country]] = {
+  guarantee[C.ConnectionIO, Option[Country]](
+    C.createStatement.flatMap(C.embed(_,
+      guarantee[S.StatementIO, Option[Country]](
+        S.executeQuery(query).flatMap(S.embed(_,
+          guarantee[RS.ResultSetIO, Option[Country]](country)(
+            RS.close))))(S.close))))(C.close)
+}
+```
+
+--
+* `guarantee` is like a functional `finally`
+
+--
+* `embed` lets us embed one level of JDBC operation in another
+
+--
+* Provided a `Connection`, we can interpret this into `IO`
+
+--
+* If you write code like this, it might be something to talk about
+should you ever meet the Head of State of the Vatican City.
+
+---
+# What have we wrought?
+
+--
+* All this work got us referential transparency
+
+--
+* Referential transparency permits substitution
+
+--
+* Substitution permits composition
+
+--
+* We can compose higher-level APIs on top of the low level API
+
+---
+# High level
+
+```scala
+import doobie._, doobie.implicits._
+// import doobie._
+// import doobie.implicits._
+
+val program = {
+  sql"""select name, headofstate from country
+        where continent = 'Europe' order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+// program: cats.free.Free[doobie.free.connection.ConnectionOp,Option[Country]] = Free(...)
+```
+
+--
+* `sql` defines a `Fragment`. More about this in a bit.
+
+--
+* `query` maps our results to a primitive, tuple, case class, `Option`, `HList`, and more.
+
+--
+* `.to` maps the result set to a collection.  Can also do a unique value, an `Option`, a `NonEmptyList`, or an `fs2.Stream`
+
+--
+* Safely acquires and disposes of JDBC resources
+
+---
+# Transactor
+
+`xa` is a _transactor_.
+
+```scala
+import cats.effect._
+implicit val cs = IO.contextShift(scala.concurrent.ExecutionContext.global)
+val xa = Transactor.fromDriverManager[IO](
+  "org.postgresql.Driver", // driver classname
+  "jdbc:postgresql:world", // connect URL (driver-specific)
+  "indyscala",             // user
+  "password"               // password
+)
+```
+
+--
+* Borrows a `Connection` from the `DriverManager`
+
+--
+* Shifts execution to a thread pool for blocking
+
+--
+* Begins a transaction
+
+--
+* Interprets the `ConnectionIO ~> IO`
+
+--
+* Commits (or rolls back) the transaction
+
+--
+* Shifts back to the `ContextShift`
+
+---
+# Does it work?
+
+```scala
+program.transact(xa).unsafeRunSync()
+// doobie.util.invariant$NonNullableColumnRead: SQL `NULL` read at column 2 (JDBC type Char) but mapping is to a non-Option type; use Option here. Note that JDBC column indexing is 1-based.
+//   at doobie.util.Get.unsafeGetNonNullable(get.scala:29)
+//   at doobie.util.Read$.$anonfun$fromGet$1(read.scala:75)
+//   at doobie.util.Read$.$anonfun$fromGet$1$adapted(read.scala:75)
+//   at doobie.util.LowerPriorityRead.$anonfun$product$1(read.scala:99)
+//   at doobie.util.LowerPriorityRead.$anonfun$product$1$adapted(read.scala:99)
+//   at doobie.util.LowerPriorityRead.$anonfun$product$1(read.scala:99)
+//   at doobie.util.LowerPriorityRead.$anonfun$product$1$adapted(read.scala:99)
+//   at doobie.util.LowerPriorityRead.$anonfun$generic$1(read.scala:106)
+//   at doobie.util.LowerPriorityRead.$anonfun$generic$1$adapted(read.scala:106)
+//   at doobie.hi.resultset$.$anonfun$build$1(resultset.scala:91)
+//   at doobie.free.KleisliInterpreter.$anonfun$raw$2(kleisliinterpreter.scala:128)
+//   at cats.effect.internals.IORunLoop$.cats$effect$internals$IORunLoop$$loop(IORunLoop.scala:85)
+//   at cats.effect.internals.IORunLoop$.startCancelable(IORunLoop.scala:41)
+//   at cats.effect.internals.IOBracket$BracketStart.run(IOBracket.scala:74)
+//   at cats.effect.internals.Trampoline.cats$effect$internals$Trampoline$$immediateLoop(Trampoline.scala:70)
+//   at cats.effect.internals.Trampoline.startLoop(Trampoline.scala:36)
+//   at cats.effect.internals.TrampolineEC$JVMTrampoline.super$startLoop(TrampolineEC.scala:93)
+//   at cats.effect.internals.TrampolineEC$JVMTrampoline.$anonfun$startLoop$1(TrampolineEC.scala:93)
+//   at scala.runtime.java8.JFunction0$mcV$sp.apply(JFunction0$mcV$sp.java:12)
+//   at scala.concurrent.BlockContext$.withBlockContext(BlockContext.scala:81)
+//   at cats.effect.internals.TrampolineEC$JVMTrampoline.startLoop(TrampolineEC.scala:93)
+//   at cats.effect.internals.Trampoline.execute(Trampoline.scala:43)
+//   at cats.effect.internals.TrampolineEC.execute(TrampolineEC.scala:44)
+//   at cats.effect.internals.IOBracket$BracketStart.apply(IOBracket.scala:60)
+//   at cats.effect.internals.IOBracket$BracketStart.apply(IOBracket.scala:41)
+//   at cats.effect.internals.IORunLoop$.cats$effect$internals$IORunLoop$$loop(IORunLoop.scala:134)
+//   at cats.effect.internals.IORunLoop$RestartCallback.signal(IORunLoop.scala:336)
+//   at cats.effect.internals.IORunLoop$RestartCallback.apply(IORunLoop.scala:357)
+//   at cats.effect.internals.IORunLoop$RestartCallback.apply(IORunLoop.scala:303)
+//   at cats.effect.internals.IOShift$Tick.run(IOShift.scala:36)
+//   at java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1149)
+//   at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:624)
+//   at java.lang.Thread.run(Thread.java:748)
+```
+
+---
+# The bad news is that San Marino has two Captains Regent
+
+and therefore a null `headofstate` column.
+
+--
+
+The good news is that we can easily validate our queries at test time.
+
+---
+# Testing
+```scala
+check(query)
+```
+
+```
+[info] + Query0[Test.Country] defined at Test.scala:25
+[info]   
+[info]     select name, headofstate from country
+[info]     where continent = 'Europe' order by population asc
+[info]   
+[info]   + SQL Compiles and TypeChecks
+[info]   + C01 name        VARCHAR (text) NOT NULL  →  String
+[error]   x C02 headofstate VARCHAR (text) NULL      →  String
+[error]    Reading a NULL value into String will result in a runtime failure. Fix
+[error]    this by making the schema type NOT NULL or by changing the Scala type
+[error]    to Option[String] (analysisspec.scala:66)
+```
+
+---
+# Habemus papam
+
+```scala
+import doobie._, doobie.implicits._
+// import doobie._
+// import doobie.implicits._
+
+case class Country(name: String, headOfState: Option[String])
+// defined class Country
+
+val program = {
+  sql"""select name, headofstate from country
+        where continent = 'Europe' order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+// program: cats.free.Free[doobie.free.connection.ConnectionOp,Option[Country]] = Free(...)
+
+program.transact(xa).unsafeRunSync()
+// res4: Option[Country] = Some(Country(Holy See (Vatican City State),Some(Johannes Paavali II)))
+```
+
+---
+# Tracing
+
+If we turn on trace logging (and get on a branch), we can see the operations it
+compiled down to.
+
+```
+TRACE doobie.transactor - PgConnection<2baa1fe>.setAutoCommit(false)
+TRACE doobie.transactor - PgConnection<2baa1fe>.prepareStatement(select name, headofstte from country
+lation asc)
+TRACE doobie.transactor - PgPreparedStatement<61cb1b5c>.executeQuery()
+TRACE doobie.transactor - PgResultSet<3213cd26>.close()
+TRACE doobie.transactor - PgPreparedStatement<61cb1b5c>.close()
+TRACE doobie.transactor - PgConnection<2baa1fe>.commit()
+TRACE doobie.transactor - PgConnection<2baa1fe>.close()
+```
+
+---
+# Revisiting the atrocities
+
+--
+* ~~No resource safety~~
+
+--
+
+* ~~No null safety~~
+
+--
+
+* ~~No type mapping~~
+
+--
+
+* ~~Not composeable~~
+
+---
+# That `sql` is an interpolator
+
+```scala
+def program(continent: String) = {
+  sql"""select name, headofstate from country
+        where continent = $continent order by population asc"""
+    .query[Country]
+    .to[List]
+    .map(_.headOption)
+}
+// program: (continent: String)cats.free.Free[doobie.free.connection.ConnectionOp,Option[Country]]
+
+program("Asia").transact(xa).unsafeRunSync()
+// res5: Option[Country] = Some(Country(Maldives,Some(Maumoon Abdul Gayoom)))
+```
+
+---
+# You can compose queries from fragments
+
+```scala
+import Fragments.whereAndOpt
+def query(continent: Option[String], region: Option[String]) = {
+  val q =
+    fr"SELECT name, headofstate from country" ++
+    whereAndOpt(
+      continent.map(c => fr"continent = $c"),
+      region.map(r => fr"region = $r")
+    ) ++
+    fr"ORDER BY population asc"
+  q.query[Country]
+}
+```
+
+```scala
+query(None, Some("Caribbean")).to[List].map(_.take(1)).transact(xa)
+// res6: cats.effect.IO[List[Country]] = IO$1485931613
+```
+
+---
+# fs2 integration
+
+All of these examples have been materializing the entire
+result set (`to[List]`), which is a step backward from
+idiomatic JDBC.  But we can functionally stream them!
+
+```scala
+query(Some("Africa"), None).
+  stream.
+  take(5).
+  transact(xa).
+  compile
+```
+
+--
+
+I'd show you the results, but it hangs tut.  But it works.
+
+---
+# Appreciation
+
+--
+* [DemandJump](https://www.demandjump.com/) for hosting
+
+--
+* Rob Norris for Doobie
+
+<blockquote class="twitter-tweet" data-conversation="none" data-lang="en"><p lang="und" dir="ltr"><a href="https://twitter.com/timperrett?ref_src=twsrc%5Etfw">@timperrett</a> <a href="https://t.co/qqHPLJ4BbJ">pic.twitter.com/qqHPLJ4BbJ</a></p>&mdash; Rob Norris (@tpolecat) <a href="https://twitter.com/tpolecat/status/684985229111459840?ref_src=twsrc%5Etfw">January 7, 2016</a></blockquote>
+
+--
+* You all, for not leaving at the depths of the low-level free monad
+
+
+--- class: center, middle
+
+# Thanks! Code and slides at `indyscala/doobie` on GitHub
+
+I'm `@rossabaker` on GitHub and Twitter and I work at @FormationAI.
+
+## Questions?
+
+
+
+
+
+ </textarea>
+    <script src="remark-latest.min.js">
+    </script>
+    <script src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
+    <script>
+      var slideshow = remark.create();
+    </script>
+  </body>
+</html>
