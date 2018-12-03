@@ -354,7 +354,7 @@ val prog: IO[Unit] = {
     } finally stmt.close()
   } finally conn.close()
 }
-// prog: cats.effect.IO[Unit] = IO$1386173049
+// prog: cats.effect.IO[Unit] = IO$202094036
 ```
 
 ```scala
@@ -388,7 +388,7 @@ org.postgresql.util.PSQLException: This ResultSet is closed.
 ---
 # Doobie
 
-          <blockquote class="twitter-tweet" data-lang="en"><p lang="en" dir="ltr">Is that legal in Indiana now? <a href="https://t.co/Y75oUnZgBx">pic.twitter.com/Y75oUnZgBx</a></p>&mdash; sr. chewbacca consultant (@rit) <a href="https://twitter.com/rit/status/1067821093908471820?ref_src=twsrc%5Etfw">November 28, 2018</a></blockquote>
+<blockquote class="twitter-tweet" data-lang="en"><p lang="en" dir="ltr">Is that legal in Indiana now? <a href="https://t.co/Y75oUnZgBx">pic.twitter.com/Y75oUnZgBx</a></p>&mdash; sr. chewbacca consultant (@rit) <a href="https://twitter.com/rit/status/1067821093908471820?ref_src=twsrc%5Etfw">November 28, 2018</a></blockquote>
 
 ---
 # Low-level API
@@ -666,7 +666,7 @@ def query(continent: Option[String], region: Option[String]) = {
 
 ```scala
 query(None, Some("Caribbean")).to[List].map(_.take(1)).transact(xa)
-// res6: cats.effect.IO[List[Country]] = IO$1466183016
+// res6: cats.effect.IO[List[Country]] = IO$1225209370
 ```
 
 ---
