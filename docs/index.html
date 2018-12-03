@@ -354,7 +354,7 @@ val prog: IO[Unit] = {
     } finally stmt.close()
   } finally conn.close()
 }
-// prog: cats.effect.IO[Unit] = IO$187918208
+// prog: cats.effect.IO[Unit] = IO$1386173049
 ```
 
 ```scala
@@ -666,7 +666,7 @@ def query(continent: Option[String], region: Option[String]) = {
 
 ```scala
 query(None, Some("Caribbean")).to[List].map(_.take(1)).transact(xa)
-// res6: cats.effect.IO[List[Country]] = IO$1485931613
+// res6: cats.effect.IO[List[Country]] = IO$1466183016
 ```
 
 ---
@@ -691,19 +691,12 @@ I'd show you the results, but it hangs tut.  But it works.
 ---
 # Appreciation
 
---
 * [DemandJump](https://www.demandjump.com/) for hosting
-
---
 * Rob Norris for Doobie
-
-<blockquote class="twitter-tweet" data-conversation="none" data-lang="en"><p lang="und" dir="ltr"><a href="https://twitter.com/timperrett?ref_src=twsrc%5Etfw">@timperrett</a> <a href="https://t.co/qqHPLJ4BbJ">pic.twitter.com/qqHPLJ4BbJ</a></p>&mdash; Rob Norris (@tpolecat) <a href="https://twitter.com/tpolecat/status/684985229111459840?ref_src=twsrc%5Etfw">January 7, 2016</a></blockquote>
-
---
 * You all, for not leaving at the depths of the low-level free monad
 
-
---- class: center, middle
+---
+class: center, middle
 
 # Thanks! Code and slides at `indyscala/doobie` on GitHub
 
